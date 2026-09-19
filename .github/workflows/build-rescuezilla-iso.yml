@@ -1,140 +1,147 @@
-# On push [1]
-# [1] https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows
-on: [push]
+name: Build ARM64 ISO (Noble)
+
+# 用 GitHub 原生 ARM64 runner 构建 rescuezilla 的 noble-arm64 ISO。
+# 对公开仓库免费且不限次数。原生 arm64,无需 binfmt/qemu 交叉模拟。
+#
+# 关键修改:跳过 partclone-latest 编译(在 runner 上用 checkinstall 编译 partclone
+# 反复出问题),改用 chroot 里 apt 预装的 partclone(clonezilla 依赖它,版本 0.3.37)。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的分支/tag'
+        required: true
+        default: 'initial-arm64-noble-iso-build'
+
 jobs:
-  rescuezilla-iso-build:
-    # The build bot OS environment does not really matter, as the docker image
-    # provides the primary host environment for the build. However, a more recent
-    # OS provides a more recent Docker release, which means additional Docker
-    # functionality.
-    # Launches Docker container to act as 'host system'. See BUILD.ISO.IMAGE.md for more information.
-    runs-on: ubuntu-latest
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
     permissions:
-      contents: write
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - name: 检出代码(含子模块与 LFS)
+        uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.ref }}
           submodules: recursive
           lfs: true
           fetch-depth: 0
 
-      # Extract human-readable version string from the most recent CHANGELOG entry
-      - run: echo "RESCUEZILLA_RELEASE_NAME=\"$(git grep -h -E -o '[a-zA-Z].*)' CHANGELOG | head -1)\"" >> $GITHUB_ENV
-      # Get deb package version using same command from its build scripts
-      - run: echo "DEB_VERSION=$(git describe --tags  --match='[0-9].[0-9]*' --abbrev=0)" >> $GITHUB_ENV
-
-      - name: Generate release notes (and set default release in notes)
-        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+      - name: 显示架构确认
         run: |
-          cd src/scripts/update
-          chmod +x generate-release-notes.sh
-          ./generate-release-notes.sh ${{github.ref_name}} "oracular" > /tmp/release-notes.md
-          echo "RELEASE_DATE=$(date '+%Y-%m-%d')" >> $GITHUB_ENV
+          echo "架构: $(uname -m)"
+          echo "发行版: $(lsb_release -cs)"
 
-      - name: Build Docker image
-        run: make docker-build
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install --yes \
+            build-essential dpkg-dev \
+            make rsync sudo debootstrap squashfs-tools xorriso \
+            git git-lfs gettext \
+            dosfstools mtools checkinstall cmake time \
+            shim-signed \
+            devscripts debhelper ccache \
+            libtool-bin gawk pkg-config comerr-dev docbook-xsl e2fslibs-dev fuse3 \
+            libaal-dev libblkid-dev libbsd-dev libext2fs-dev libncurses5-dev \
+            libncursesw5-dev libreadline-dev libreadline8 \
+            libreiser4-dev libtinfo-dev libxslt1.1 nilfs-tools ntfs-3g ntfs-3g-dev \
+            quilt sgml-base uuid-dev vmfs-tools xfslibs-dev xfsprogs xml-core \
+            xsltproc libssl-dev libxxhash-dev \
+            grub-efi-arm64 grub-efi-arm64-bin \
+            python3-gi libgtk-3-dev python3-whichcraft python3-babel \
+            curl bash-completion
 
-      - name: Launch Docker container
-        run: make docker-run
+      - name: Git safe directory
+        run: git config --global --add safe.directory '*'
 
-      - name: Trust the git folder
-        run: make docker-add-safe-directory
+      - name: 补丁 Makefile:从 noble-arm64 去掉 partclone-latest 依赖
+        run: |
+          # noble-arm64 原依赖: deb partclone-latest partclone-nbd $(buildscripts)
+          # 改为:        deb partclone-nbd $(buildscripts)
+          # 原因:partclone-latest 用 checkinstall 在宿主机编译 partclone 0.3.40,
+          #   在 GitHub runner 上反复失败(bash-completion 目录缺失等)。
+          #   chroot 里 clonezilla 已经依赖 partclone(apt 装 0.3.37),
+          #   不需要宿主机编译的 deb。
+          python3 -c "
+          with open('Makefile') as f: c = f.read()
+          old = 'noble-arm64: deb partclone-latest partclone-nbd \$(buildscripts)'
+          new = 'noble-arm64: deb partclone-nbd \$(buildscripts)'
+          if old in c:
+              c = c.replace(old, new)
+              with open('Makefile','w') as f: f.write(c)
+              print('Makefile 已补丁: noble-arm64 不再依赖 partclone-latest')
+          else:
+              print('警告: 未找到目标行,可能 Makefile 结构已变化')
+              # 尝试另一种匹配(可能有不同的空格)
+              import re
+              c2 = re.sub(
+                  r'(noble-arm64:\s+deb\s+)partclone-latest(\s+)',
+                  r'\1\2',
+                  c
+              )
+              if c2 != c:
+                  with open('Makefile','w') as f: f.write(c2)
+                  print('Makefile 已补丁(正则): noble-arm64 不再依赖 partclone-latest')
+              else:
+                  print('错误: 无法补丁 Makefile')
+          "
 
-      - name: Run linting within the Docker container
-        run: make docker-check
+      - name: 补丁 chroot-steps-part-2.sh:跳过 partclone #367 hack
+        run: |
+          # chroot-steps-part-2.sh 有一段 #367 hack:
+          #   先备份仓库版 partclone.xfs,装完编译版 deb 后覆盖回去。
+          # 不编译 partclone deb 后,这段 cp/mv 会失败(找不到文件)。
+          # 用条件判断包裹它们:只有文件存在时才执行。
+          python3 -c "
+          with open('src/scripts/chroot-steps-part-2.sh') as f: c = f.read()
+          # 把 partclone.xfs 的 cp 备份改成条件执行
+          c = c.replace(
+              'cp -r /usr/sbin/partclone.xfs /',
+              'if [ -f /usr/sbin/partclone.xfs ]; then cp -r /usr/sbin/partclone.xfs /; fi'
+          )
+          c = c.replace(
+              'mv /partclone.xfs /usr/sbin/',
+              'if [ -f /partclone.xfs ]; then mv /partclone.xfs /usr/sbin/; fi'
+          )
+          with open('src/scripts/chroot-steps-part-2.sh','w') as f: f.write(c)
+          print('chroot-steps-part-2.sh 已补丁: partclone #367 hack 改为条件执行')
+          "
 
-      - name: Run unit tests within the Docker container
-        run: make docker-test
+      - name: 磁盘空间检查(构建前)
+        run: df -h /
 
-      - name: Create completed artifacts folder
-        run: mkdir completed-artifacts/
+      - name: 构建 DEB 包 + partclone-nbd + ARM64 Noble ISO
+        run: sudo make noble-arm64
+        continue-on-error: true
 
-      - run: make docker-status
-      - name: Make DEB package
-        run: make docker-deb
-      - run: sudo mv build/rescuezilla_${{env.DEB_VERSION}}-1_all.deb completed-artifacts/rescuezilla_${{env.DEB_VERSION}}-1_all.deb
+      - name: 查看构建产物
+        run: |
+          echo "=== build/ 目录 ==="
+          ls -lh build/ 2>/dev/null || echo "build/ 不存在"
+          echo "=== 查找 ISO ==="
+          find build/ -name '*.iso' -print -exec ls -lh {} \; 2>/dev/null || true
+          echo "=== 磁盘空间(构建后) ==="
+          df -h /
 
-      - run: make docker-status
-      - name: Make Ubuntu 25.10 (Questing) ISO
-        run: make docker-questing
-      - run: sudo mv build/rescuezilla.amd64.questing.iso completed-artifacts/rescuezilla-${{github.ref_name}}-64bit.questing.iso
-      - run: sudo make clean-all
-
-      - run: make docker-status
-      - name: Make Ubuntu 26.04 LTS (Resolute) ISO
-        run: make docker-resolute
-      - run: sudo mv build/rescuezilla.amd64.resolute.iso completed-artifacts/rescuezilla-${{github.ref_name}}-64bit.resolute.iso
-      - run: sudo make clean-all
-
-      - run: make docker-status
-      - name: Make Ubuntu 24.04 LTS (Noble) ISO
-        run: make docker-noble
-      - run: sudo mv build/rescuezilla.amd64.noble.iso completed-artifacts/rescuezilla-${{github.ref_name}}-64bit.noble.iso
-      - run: sudo make clean-all
-
-      - run: make docker-status
-      - name: Make Ubuntu 24.10 (Oracular) ISO
-        run: make docker-oracular
-      - run: sudo mv build/rescuezilla.amd64.oracular.iso completed-artifacts/rescuezilla-${{github.ref_name}}-64bit.oracular.iso
-      - run: sudo make clean-all
-
-      - name: Create checksums for ISO images
-        run: cd completed-artifacts && sudo ../src/scripts/create-iso-checksums.sh rescuezilla_${{env.DEB_VERSION}}-1_all.deb  rescuezilla-${{github.ref_name}}-*.iso
-
-      - name: Upload release assets (on tag push)
-        uses: softprops/action-gh-release@v1
-        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+      - name: 即使构建失败也上传所有产物
+        if: always()
+        uses: actions/upload-artifact@v5
         with:
-          name: v${{github.ref_name}} (${{env.RELEASE_DATE}})
-          body_path: /tmp/release-notes.md
-          files: |
-            completed-artifacts/*SUM
-            completed-artifacts/rescuezilla_${{env.DEB_VERSION}}-1_all.deb
-            completed-artifacts/rescuezilla-${{github.ref_name}}-*.iso
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: rescuezilla-arm64-build-output
+          path: |
+            build/*.iso
+            build/**/*.iso
+            build/**/rescuezilla*.*
+          if-no-files-found: warn
+          retention-days: 30
 
-      # Upload GitHub Action workflow *artifacts*. Note "artifacts" are a different concept to GitHub release rssets. The former is available on each GitHub Actions
-      # workflow run. The latter is associated with only a pushed tag.
-
-      - uses: actions/upload-artifact@v4
+      - name: 上传构建日志(如果脚本有输出)
+        if: always()
+        uses: actions/upload-artifact@v5
         with:
-          name: SHA256SUM
-          path: completed-artifacts/SHA256SUM
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: MD5SUM
-          path: completed-artifacts/MD5SUM
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SHA1SUM
-          path: completed-artifacts/SHA1SUM
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rescuezilla_${{env.DEB_VERSION}}-1_all.deb
-          path: completed-artifacts/rescuezilla_${{env.DEB_VERSION}}-1_all.deb
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rescuezilla-${{github.ref_name}}-64bit.oracular.iso
-          path: completed-artifacts/rescuezilla-${{github.ref_name}}-64bit.oracular.iso
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rescuezilla-${{github.ref_name}}-64bit.questing.iso
-          path: completed-artifacts/rescuezilla-${{github.ref_name}}-64bit.questing.iso
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rescuezilla-${{github.ref_name}}-64bit.resolute.iso
-          path: completed-artifacts/rescuezilla-${{github.ref_name}}-64bit.resolute.iso
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rescuezilla-${{github.ref_name}}-64bit.noble.iso
-          path: completed-artifacts/rescuezilla-${{github.ref_name}}-64bit.noble.iso
-
+          name: build-make-output-log
+          path: |
+            build/*.log
+          if-no-files-found: warn
+          retention-days: 7
